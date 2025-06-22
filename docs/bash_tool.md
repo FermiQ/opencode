@@ -1,0 +1,110 @@
+# bash.go (in internal/llm/tools)
+
+## Overview
+
+The `bash.go` file, part of the `internal/llm/tools` package, defines the "bash" tool. This tool enables an AI agent to execute shell commands within a persistent shell session. It includes comprehensive safety measures, such as a list of banned commands, permission requests for non-read-only commands, and output truncation. A significant portion of the tool's description (which forms part of the prompt for the LLM) provides detailed, step-by-step instructions on how to perform common `git` operations (commits, pull requests) and general best practices for using the shell.
+
+## Key Components
+
+### Structs
+- `BashParams`: Defines the expected JSON parameters when the LLM calls the bash tool.
+    - `Command (string)`: The shell command to execute.
+    - `Timeout (int)`: Optional timeout in milliseconds for the command.
+- `BashPermissionsParams`: Struct used for permission requests, mirroring `BashParams`.
+- `BashResponseMetadata`: Struct to hold metadata about the command execution.
+    - `StartTime (int64)`: Unix milliseconds.
+    - `EndTime (int64)`: Unix milliseconds.
+- `bashTool`: Implements the `BaseTool` interface.
+    - `permissions (permission.Service)`: Service to handle permission requests.
+
+### Constants
+- `BashToolName ("bash")`: The registered name of the tool.
+- `DefaultTimeout (1 * 60 * 1000)`: 1 minute in milliseconds, default timeout for commands.
+- `MaxTimeout (10 * 60 * 1000)`: 10 minutes in milliseconds, maximum allowed timeout.
+- `MaxOutputLength (30000)`: Maximum number of characters for stdout/stderr before truncation.
+
+### Variables
+- `bannedCommands ([]string)`: A list of shell commands that are disallowed for security or operational reasons (e.g., `curl`, `wget`, network utilities, browsers).
+- `safeReadOnlyCommands ([]string)`: A list of commands (and command prefixes) considered safe and read-only, which can be executed without explicit user permission. This includes many common `git` read operations, `go` utility commands, and basic system info commands.
+
+### Functions
+- `bashDescription() string`: Generates a very detailed description string for the bash tool. This description is provided to the LLM and includes:
+    - General usage instructions (directory verification, security checks, output processing).
+    - A list of banned commands.
+    - Specific instructions for avoiding `find`, `grep`, `cat`, etc., in favor of other dedicated tools.
+    - Emphasis on using absolute paths and maintaining the current working directory.
+    - **Detailed Git Workflow Instructions**:
+        - For `git commit`: Steps for checking status, diff, log, adding files, drafting a commit message (with `<commit_analysis>` tags for the LLM's thought process), and formatting the commit message with a HEREDOC, including "🤖 Generated with opencode" and "Co-Authored-By" footers. Also handles pre-commit hook scenarios.
+        - For creating pull requests (`gh pr create`): Steps for checking branch status, diffs, logs, creating new branches, committing, pushing, and then drafting a PR summary (with `<pr_analysis>` tags), followed by a specific `gh pr create` command format using HEREDOC for the body.
+    - Important notes on combining `git add` and `git commit`, avoiding interactive git commands, and not pushing unless necessary for a PR.
+- `NewBashTool(permission permission.Service) BaseTool`: Constructor for `bashTool`.
+- `(b *bashTool) Info() ToolInfo`: Returns metadata about the bash tool, including its name, the detailed description from `bashDescription()`, and parameter schema.
+- `(b *bashTool) Run(ctx context.Context, call ToolCall) (ToolResponse, error)`: The core logic when the bash tool is invoked.
+    1.  Parses `call.Input` into `BashParams`.
+    2.  Validates and clamps the `Timeout` value.
+    3.  Checks if the command is empty or if the base command is in `bannedCommands`.
+    4.  Determines if the command is in `safeReadOnlyCommands`.
+    5.  If not a safe read-only command, it requests permission using `b.permissions.Request()`. If denied, returns a permission error.
+    6.  Gets a persistent shell session for the current working directory using `shell.GetPersistentShell()`.
+    7.  Executes the command in the shell with the specified timeout.
+    8.  Truncates stdout and stderr if they exceed `MaxOutputLength` using `truncateOutput()`.
+    9.  Combines stdout, stderr, and any exit/interruption messages into a single response string.
+    10. Returns the response, including execution time metadata.
+- `truncateOutput(content string) string`: Truncates a string if it's longer than `MaxOutputLength`, keeping the beginning and end parts and indicating the number of truncated lines in the middle.
+- `countLines(s string) int`: Counts lines in a string.
+
+## Important Variables/Constants
+- `bannedCommands` and `safeReadOnlyCommands`: Crucial for security and permission handling.
+- The extensive string generated by `bashDescription()`: This is a key part of the system, as it provides detailed instructions and constraints to the LLM on how to use the bash tool, especially for complex git workflows.
+
+## Usage Examples
+
+This tool is invoked by an LLM when it needs to execute a shell command.
+
+LLM wants to list files:
+```json
+{
+  "type": "tool_use",
+  "id": "tool_call_bash_ls",
+  "name": "bash",
+  "input": { "command": "ls -la" }
+}
+```
+`bashTool.Run` would:
+1. Identify `ls -la` as a safe read-only command.
+2. Execute it in the persistent shell.
+3. Return the output.
+
+LLM wants to commit changes (following the detailed instructions in `bashDescription`):
+The LLM would first run `git status`, `git diff`, `git log` (potentially in one message with multiple tool calls). Then, after its `<commit_analysis>`, it would generate a tool call like:
+```json
+{
+  "type": "tool_use",
+  "id": "tool_call_bash_commit",
+  "name": "bash",
+  "input": {
+    "command": "git commit -m \"$(cat <<'EOF'\nFix: Corrected off-by-one error in pagination.\n\nThis resolves issue #123 by adjusting the loop boundary.\n\n🤖 Generated with opencode\nCo-Authored-By: opencode <noreply@opencode.ai>\nEOF\n)\""
+  }
+}
+```
+`bashTool.Run` would:
+1. See `git commit` is not in `safeReadOnlyCommands`.
+2. Request permission from the user.
+3. If approved, execute the commit command.
+4. Return the output from git.
+
+## Dependencies and Interactions
+
+- **Internal Dependencies:**
+    - `github.com/opencode-ai/opencode/internal/config`: For `config.WorkingDirectory()`.
+    - `github.com/opencode-ai/opencode/internal/llm/tools/shell`: For `shell.GetPersistentShell()` to get a persistent shell session.
+    - `github.com/opencode-ai/opencode/internal/permission`: For `permission.Service` to request user approval for commands.
+    - Relies on `ToolCall`, `ToolResponse`, `BaseTool`, `ToolInfo` types from the parent `tools` package.
+- **External Libraries:**
+    - `encoding/json`: For parsing input parameters.
+    - `fmt`, `strings`, `time`, `context`: Standard Go libraries.
+- **Interactions:**
+    - Provides powerful shell access to the AI agent, with safety checks and permission layers.
+    - The persistent shell (`shell.GetPersistentShell()`) means that environment changes (like `cd`, setting environment variables, activating virtual environments) made in one bash tool call will affect subsequent calls within the same session.
+    - The detailed instructions embedded in `bashDescription()` are critical for guiding the LLM to use this tool correctly and safely, especially for multi-step `git` operations.
+    - Output truncation prevents excessively long outputs from overwhelming the LLM or the user.
